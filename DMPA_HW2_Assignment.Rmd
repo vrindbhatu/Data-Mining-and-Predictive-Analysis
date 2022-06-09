@@ -1,0 +1,385 @@
+---
+title: "Assignment 2 File"
+output:
+  html_document:
+    df_print: paged
+---
+\vspace{0.25in}
+
+### Due March 29, 2022
+### Worth 40 points total
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(tree)
+library(class)
+library(glmnet)
+library(ROCR) 
+```
+
+## Problem Overview
+
+Lending Club is an online, peer-to-peer marketplace that connects borrowers and investors. This assignment asks you to do some predictive modeling on a dataset of past Lending Club loans, including loan details and information about the borrowers. A full data dictionary can be found in LCDataDictionary.xlsx.
+
+The goal of this assignment is to get hands-on practice with data cleaning, feature engineering, and predictive modeling algorithms beyond the basics, including classification trees, kNNs, and regularized logistic regression. You will also practice creating and interpreting ROC and lift curves.
+
+You will be predicting whether loans were paid in full or not. Your intended use case is to help an organization decide which loans to "flag" as potentially risky investments. 
+
+RUBRIC: There are three possible grades on this assignment: Fail (F), Pass (P), and High Pass (H). If you receive an F then you will have one more chance to turn it in to receive a P. If you receive H on 3 out of the 4 assignments this semester you'll get a bonus point on your final average.
+
+1.  Turn in a well-formatted compiled HTML document using R markdown. If you turn in a different file type or your code doesn't compile, you will be asked to redo the assignment.
+2.  Provide clear answers to the questions and the correct R commands as necessary, in the appropriate places. You may answer up to three sub-questions incorrectly and still receive a P on this assignment (for example, 1(a) counts as one sub-question). If you answer all sub-questions correctly on your first submission you will receive an H.
+3.  The entire document must be clear, concise, readable, and well-formatted. If your assignment is unreadable or if you include more output than necessary to answer the questions you will be asked to redo the assignment.
+
+Note that this assignment is somewhat open-ended and there are many ways to answer these questions. I don't require that we have exactly the same answers in order for you to receive full credit.
+
+
+The following code block does some intial setup, including:
+
+1. Reading the dataset (make sure to set your working diretory)
+2. Creating the target variable
+3. Setting the random seed
+4. Selecting a subsample of 15k observations in order to speed up training time
+5. Selecting the training and validation row numbers
+
+```{r data_setup}
+lc <- read_csv("LendingClub_LoanStats_2011_v2.csv")  #read the Lending Club dataset in R
+
+#create target variable: fully paid
+#remove any rows where y is NA
+lc <- lc %>%
+  mutate(y = as.factor(ifelse(loan_status == "Fully Paid", "Paid", "Not Paid"))) %>%
+  filter(!is.na(y))
+
+#set seed and randomly downsample 15k instances 
+#(otherwise training kNN will take hours)
+set.seed(1)
+lc_small <- sample(nrow(lc), 15000)
+lc <- lc[lc_small,]
+
+#then calculate the training/validation row numbers, but don't yet split
+va_inst <- sample(nrow(lc), .3*nrow(lc))
+
+```
+
+## 0: Example answer
+
+What is the mean loan amount in this dataset??
+
+**ANSWER: The loan amount in this dataset is $10,993.60.**
+
+```{r code0}
+loan_mean <- lc %>%
+  summarise(mean_amt = mean(loan_amnt))
+```
+
+## 1: Data Cleaning and Feature Engineering
+
+a. Clean and process the following variables in the Lending Club dataset:
+
++ grade, sub_grade, home_ownership, addr_state: check if there are NAs and add a NULL value if so
++ loan_amnt: check if there are NAs, and if there are, replace with the mean loan amount (by grade)
++ emp_length: group into bins: <1 year, 1-3 years, 4-6 years, 7-9 years, 10+ years, and "unknown"
++ annual_inc: replace NAs with the average value, then group into four bins based on quartile values
++ purpose: any factor levels with fewer than 200 instances should get grouped into "other". Also, combine credit_card and debt_consolidation into "debt".
++ dti: group into five equally-sized bins
++ mths_since_last_delinq: group into five bins (< 1 year, 1-2 years, 2-3 years, 3+ years, never)
++ int_rate: make sure this has the correct data type, process it if not. Check for NAs and replace by the mean.
++ y: convert into a factor
+
+**ANSWER TO QUESTION 1a HERE:** 
+
+```{r code_1a}
+lc <- lc%>%
+  mutate(grade = ifelse(is.na(grade),NULL,grade),
+    sub_grade = ifelse(is.na(sub_grade),NULL,sub_grade),
+    home_ownership = ifelse(is.na(home_ownership),NULL,home_ownership),
+    addr_state = ifelse(is.na(addr_state),NULL,addr_state))
+
+lc <- lc %>%
+  group_by(grade) %>%
+    mutate(loan_amnt = ifelse(is.na(loan_amnt),mean(loan_amnt,na.rm=TRUE),loan_amnt)) %>%
+  ungroup()
+  
+lc <- lc %>%  
+  mutate(emp_length = case_when(
+            emp_length %in% c('< 1 year') ~ '<1 year',
+            emp_length %in% c('1 year','2 years', '3 years') ~ '1-3 years',
+            emp_length %in% c('4 years','5 years', '6 years') ~ '4-6 years',
+            emp_length %in% c('7 years','8 years', '9 years') ~ '7-9 years',
+            emp_length %in% c('10+ years') ~ '10+ years',
+            TRUE ~ 'unknown'),
+         emp_length = as.factor(emp_length))
+
+lc <- lc %>%        
+         mutate(annual_inc = (ifelse(is.na(annual_inc),mean(annual_inc, na.rm= TRUE),annual_inc)),
+         annual_inc = ntile(annual_inc, 4),
+         annual_inc = as.factor(annual_inc))
+
+lc <- lc %>%
+  group_by(purpose)%>%
+  mutate(n_purpose = n(),
+         purpose = ifelse(n_purpose < 200 , "other",purpose),
+         purpose = case_when(
+           purpose %in% c('credit_card', 'debt_consolidation') ~ 'debt',
+           TRUE ~ purpose),
+         purpose = as.factor(purpose)) %>%
+  ungroup()
+
+
+lc <- lc%>%
+  mutate(dti = cut(dti , breaks = 5))
+         
+lc <- lc %>%
+   mutate(mths_since_last_delinq = case_when(
+   mths_since_last_delinq %in% c(0:11) ~ '<1 year',
+   mths_since_last_delinq %in% c(12:24) ~ '1-2 year',
+   mths_since_last_delinq %in% c(24:36) ~ '2-3 year',
+   mths_since_last_delinq %in% c(36:max(mths_since_last_delinq,na.rm=TRUE)) ~ '3+ year',
+   TRUE ~ "never"),
+   mths_since_last_delinq = as.factor(mths_since_last_delinq))
+    
+lc <- lc%>%
+  mutate(int_rate = gsub("%","",int_rate),
+         int_rate = as.double(int_rate),
+         int_rate = ifelse(is.na(int_rate),mean(int_rate,na.rm= TRUE),int_rate))
+
+lc <- lc%>%
+  mutate(y= as.factor(y))
+
+```
+
+b. At this point you should have 12 cleaned variables (including y). 
++Convert the set of cleaned and processed variables into dummy variables. Also create dummy variables that interact the (binned) annual income and (binned) employment length variables. 
++You will end up with dummy variables for both y = "Paid" and y = "Not Paid". Drop the y = "Paid" dummy variable and convert the "Not Paid" dummy variable into a factor. 
++How many variables do you have after converting to dummies and dropping the y = Paid dummy? 
++Finally, partition your dataset into "train" and "test" using the va_inst row numbers sampled above.
+
+**ANSWER TO QUESTION 1b HERE:** 
+There are 153 variables after converting to dummies and dropping the y = Paid Dummy.
+
+```{r code_1b}
+lc1 <- lc %>% 
+  select(grade, sub_grade, home_ownership, addr_state, loan_amnt, emp_length, annual_inc, purpose, dti, mths_since_last_delinq, int_rate, y)
+
+dummy <- dummyVars(~. + annual_inc : emp_length,data=lc1)
+
+lc2 <- data.frame(predict(dummy, newdata =lc1))
+lc2$y.Paid <- NULL
+lc2$y.Not.Paid <- as.factor(lc2$y.Not.Paid)
+ncol(lc2)
+
+valid_lc <- lc2[va_inst,]
+train_lc <- lc2[-va_inst,]
+
+```
+
+
+## 2: Trees
+
+a. Use the following code to create an unpruned tree (replace YOUR_Y_VAR and YOUR_TRAINING_DATA with the appropriate variable names, then uncomment the line starting with "lc.full.tree=tree..."). How many terminal nodes are in the full tree? Which variable has the highest-information gain (leads to the biggest decrease in impurity)? How do you know?
+
+**ANSWER TO QUESTION 2a HERE:** 
+There are 131 terminal nodes in the full tree. The root node is the highest information gain variable which is int_rate. R has an inbuilt algorithm which decides the variable that has the highest information gain and splits accordingly. But if we try to manually assign the root node then it won't be a tree as such.
+
+```{r code tree_setup}
+
+mycontrol = tree.control(nrow(train_lc), mincut = 5, minsize = 10, mindev = 0.0005)
+
+lc2.full.tree=tree(y.Not.Paid ~ .,control = mycontrol, train_lc)
+
+summary(lc2.full.tree)
+
+```
+
+b. Create pruned trees of size 2, 4, 6, 8, 10, 15, 20, 25, 30, 35, and 40. Plot fitting curves consisting of the accuracy in the validation and training sets for each pruned tree (assuming a cutoff of 0.5). Make sure the two sets of points are different colors.
+
+**ANSWER TO QUESTION 2b HERE:** 
+
+```{r code 2b}
+treesizes <- c(2, 4, 6, 8, 10, 15, 20, 25, 30, 35,40)
+
+valid_acc_storage <- rep(0, length(treesizes))
+train_acc_storage <- rep(0, length(treesizes))
+
+accuracy <- function(classifications, actuals){
+  correct_classifications <- ifelse(classifications == actuals, 1, 0)
+  acc <- sum(correct_classifications)/length(classifications)
+  return(acc)
+}
+
+predict_and_eval <- function(treename, pred_data, cutoff){
+  predictions <- predict(treename, newdata = pred_data)
+  probs <- predictions[,2]
+  classification <- ifelse(probs>cutoff,1,0)
+  acc <- accuracy(classification, pred_data$y.Not.Paid)
+  return(acc)
+}
+
+for(i in 1:length(treesizes)) {
+  size = treesizes[i]
+  pruned_tree = prune.tree(lc2.full.tree , best = size)
+  
+  
+  valid_acc_storage[i] <- predict_and_eval(pruned_tree,valid_lc,0.5)
+  train_acc_storage[i] <- predict_and_eval(pruned_tree,train_lc,0.5)
+  
+  
+}
+
+plot(treesizes, valid_acc_storage, type = 'l', col= 'red', ylim = c(0.750,0.800))
+lines(treesizes, train_acc_storage, col= 'blue')
+
+```
+
+c. Which tree size is the best, and how did you select the best one? Store the vector of probabilities estimated by your best tree in the validation set as a variable called best.tree.preds. We'll use these later.
+
+**ANSWER TO QUESTION 2c HERE:** 
+By looking at the graph I observed that the validation accuracy is highest when the tree sizes is 25 so I choose based on that. 
+
+```{r code 2c}
+lc2.best.tree = prune.tree(lc2.full.tree, best=25)
+plot(lc2.best.tree)
+
+best.train.preds <- predict(lc2.best.tree, newdata = train_lc)
+best.train.probs <- best.train.preds[,2]
+best.train.classification <- ifelse(best.train.probs>0.5,1,0)
+best.train.acc <- accuracy(best.train.classification, train_lc$y.Not.Paid)
+
+best.tree.preds <- predict(lc2.best.tree, newdata = valid_lc)
+best.tree.probs <- best.tree.preds[,2]
+best.tree.classification <- ifelse(best.tree.probs>0.5,1,0)
+best.tree.acc <- accuracy(best.tree.classification, valid_lc$y.Not.Paid)
+
+```
+
+
+## 3: kNN
+
+a. Compute kNN estimates in the training and validation data using k values of 2, 4, 6, 8, 10, 15, and 20. Assume a cutoff of 0.5. Plot the accuracy in the validation and training sets for each k value. Make sure the two sets of points are different colors!
+
++Note: you will need to separate your training and validation sets into X and y.
++Note: Be patient - it will take several minutes for kNN to make its predictions!
+
+**ANSWER TO QUESTION 3a HERE:** 
+
+```{r code 3a}
+colnames(lc2)
+train.X=train_lc[,c(1:128,130:153)]
+valid.X=valid_lc[,c(1:128,130:153)]
+
+train.y=train_lc$y.Not.Paid
+valid.y=valid_lc$y.Not.Paid
+
+kvec <- c(2, 4, 6, 8, 10, 15, 20) 
+
+va_acc <- rep(0, length(kvec))
+tr_acc <- rep(0, length(kvec))
+
+for(i in 1:length(kvec)){
+  k <- kvec[i]
+  va_preds <- knn(train.X, valid.X, train.y, k = k)
+  tr_preds <- knn(train.X, train.X, train.y, k = k)
+
+  va_accuracy <- accuracy(va_preds, valid.y)
+  tr_accuracy <- accuracy(tr_preds, train.y)
+
+  va_acc[i] <- va_accuracy
+  tr_acc[i] <- tr_accuracy
+}
+plot(x = kvec,tr_acc,type="l",col="red", ylim = c(0.5,1))
+lines(x = kvec,va_acc,col="green")
+
+```
+
+b. Which k is the best, and how did you select the best one? Store the vector of probabilities estimated by your best k value in the validation set as a variable called best.knn.preds. + 
+
++Note: you'll need to convert these probabilities from the probability of the majority-class vote to the probability that y = the positive class.
+
+
+**ANSWER TO QUESTION 3b HERE:** 
+In the above plot green line represents the accuracy on validation data. And it is highest when k value is equal to 20. So based on that I selected the best k value.
+
+```{r code 3b}
+best.knn.predictions=knn(train.X,
+                         valid.X,
+                         train.y, 
+                         k=20, 
+                         prob = TRUE) 
+
+best.knn.probs <- attr(best.knn.predictions, "prob")
+best.knn.preds <- ifelse(best.knn.predictions == 1, best.knn.probs, 1-best.knn.probs)
+
+```
+
+
+## 4: ROC and Lift
+
+a. Plot the ROC curves for the probability estimates generated by your best tree and kNN models on the same chart (make sure that your reader can tell which line is which). 
+
+**ANSWER TO QUESTION 4a HERE:** 
+
+```{r code_4a}
+best_tree <- prediction(best.tree.preds[,2], valid_lc$y.Not.Paid)
+best_nn <- prediction(best.knn.preds, valid.y)
+
+best.tree.roc <- performance(best_tree, "tpr", "fpr")
+best.nn.roc <- performance(best_nn, "tpr", "fpr")
+
+plot(best.tree.roc, col = "red", lwd = 2)
+plot(best.nn.roc, add = T, col  = "blue", lwd = 2)
+legend(x = "topleft",
+       legend = c("Best Tree = 25", "Best NN = 20"),
+       col = c("red", "blue"),
+       lwd = 2)
+
+```
+
+b. Compute the AUC for each model (in the validation data, of course. Which model has the highest AUC? Is this the same model as the one with the higher accuracy? Does the highest-AUC model have the highest TPR for every cutoff?
+
+**ANSWER TO QUESTION 4b HERE:** 
+AUC for tree model is 0.727 and AUC for KNN model is 0.662. As we can observe that it is higher for the tree model.Yes for most of the time it is the same model with the higher accuracy. Highest AUC model has high TPR till cutoff 0.9, but after that it decreases.
+
+```{r code_4b}
+best.tree.auc <- performance(best_tree, measure = "auc")@y.values[[1]]
+best.tree.auc
+best.nn.auc <- performance(best_nn, measure = "auc")@y.values[[1]]
+best.nn.auc
+
+```
+
+c. Plot the lift curve for your highest-AUC model. 
+
+**ANSWER TO QUESTION 4c HERE:** 
+Since tree model had the highest accuracy I have plotted the lift curve for it.
+
+```{r code_4c}
+lift_tree <- performance(best_tree, "lift", "rpp")
+
+plot(lift_tree, col = "red", lwd = 2)
+```
+
+d. If we decide to flag the top 10% of loans most likely to be "Not Paid", what will our lift be? What if we flag the top 50% of loans? If we want to achieve a lift of at least 2.0, how many loans should we flag?
+
++Note: you can answer approximately by reading your lift chart, no need to calculate the exact amounts.
+
+**ANSWER TO QUESTION 4d HERE:** 
+
+If we flag the top 10% of the loans then the lift value will change it 2.5.
+If we flag the top 50% of loans then the lift value will change to 1.5.
+For having the lift vale to be atleast 2.0, we must flag top 20% of the value.
+```{r code_4d}
+
+```
+
+
+## 5: OPTIONAL (Extra Challenge)
+
+Can you improve on the best-performing model with either more/different features, a different model specification, or a different tuning parameter (or all of the above)? Report your best validation performance and give details on your best model.
+
+**ANSWER TO QUESTION 5 HERE:** 
+```{r code_5}
+
+```
